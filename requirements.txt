@@ -1,3 +1,2 @@
-streamlit
-groq
-yt-dlp
+flet==0.25.2
+requests
