@@ -1,29 +1,33 @@
-import json
 import os
-import random
+import json
 import re
-import shutil
-import subprocess
+import random
 import urllib.parse
 import urllib.request
-import yt_dlp
-import streamlit as st
-import streamlit.components.v1 as components
-from groq import Groq
+import threading
+import subprocess
+import time
+import wave
+import requests
+import flet as ft
 
-st.set_page_config(
-    page_title="Học Tiếng Anh Qua Video",
-    page_icon="🎧",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+# ================= NẠP ENGINE MOONSHINE VOICE (NẾU CÓ) =================
+HAVE_MOONSHINE_API = False
+try:
+    from moonshine_voice import (
+        Transcriber as MV_Transcriber,
+        TranscriptEventListener as MV_TranscriptEventListener,
+        get_model_for_language as mv_get_model_for_language,
+        load_wav_file as mv_load_wav_file,
+    )
+    HAVE_MOONSHINE_API = True
+except Exception:
+    try:
+        import moonshine
+    except Exception:
+        moonshine = None
 
-# Thư mục 'static' được Streamlit phục vụ trực tiếp qua giao thức HTTPS
-MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "offline_dict.json")
-os.makedirs(MEDIA_DIR, exist_ok=True)
-
-# ================= 1. QUẢN LÝ TỪ ĐIỂN VÀ TỪ VỰNG =================
+# ================= THUẬT TOÁN ĐỐI CHIẾU TỪ ĐỒNG NGHĨA =================
 DEFAULT_SAMPLE_WORDS = [
     {"en": "conversation", "vi": "cuộc trò chuyện, đàm thoại, đối thoại", "hint": "c...n"},
     {"en": "express", "vi": "bày tỏ, biểu lộ, diễn đạt", "hint": "e...s"},
@@ -31,8 +35,6 @@ DEFAULT_SAMPLE_WORDS = [
     {"en": "interview", "vi": "phỏng vấn, cuộc gặp mặt", "hint": "i...w"},
     {"en": "confidence", "vi": "sự tự tin, lòng tin, sự tin tưởng", "hint": "c...e"}
 ]
-
-OFFLINE_DICTIONARY = {}
 
 def clean_text(s: str) -> str:
     if not s:
@@ -52,101 +54,14 @@ def extract_meanings(raw_str: str) -> list:
             results.add(c)
     return list(results)
 
-def load_offline_dictionary():
-    global OFFLINE_DICTIONARY
-    if os.path.exists(DICT_PATH):
-        try:
-            with open(DICT_PATH, "r", encoding="utf-8") as f:
-                OFFLINE_DICTIONARY = json.load(f)
-            return
-        except Exception:
-            pass
-
-    initial_dict = {
-        "hello": "xin chào, chào bạn",
-        "world": "thế giới, hoàn cầu",
-        "video": "đoạn phim, video",
-        "english": "tiếng anh",
-        "learn": "học, học tập, nghiên cứu",
-        "practice": "thực hành, rèn luyện, tập luyện",
-        "done": "hoàn thành, xong, hoàn tất"
-    }
-    OFFLINE_DICTIONARY = initial_dict
-    try:
-        with open(DICT_PATH, "w", encoding="utf-8") as f:
-            json.dump(initial_dict, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def clean_filename(name: str) -> str:
-    name = re.sub(r'[\\/*?:"<>|]', "", name)
-    name = re.sub(r'\s+', "_", name.strip())
-    return name[:60] if name else "video_hoc_tap"
-
-def get_video_vocab_path(video_name: str) -> str:
-    safe_name = clean_filename(video_name)
-    return os.path.join(MEDIA_DIR, f"{safe_name}_vocab.json")
-
-def load_vocab_for_video(video_name: str) -> list:
-    v_vocab_file = get_video_vocab_path(video_name)
-    if os.path.exists(v_vocab_file):
-        try:
-            with open(v_vocab_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    initial_words = list(DEFAULT_SAMPLE_WORDS)
-    save_vocab_for_video(video_name, initial_words)
-    return initial_words
-
-def save_vocab_for_video(video_name: str, vocab_list: list):
-    v_vocab_file = get_video_vocab_path(video_name)
-    try:
-        with open(v_vocab_file, "w", encoding="utf-8") as f:
-            json.dump(vocab_list, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def add_vocab_entry(video_name: str, word: str, meaning: str):
-    word = word.strip()
-    meaning = meaning.strip()
-    if not word or not meaning:
-        return
-    current_list = load_vocab_for_video(video_name)
-    existing = [item["en"].lower() for item in current_list]
-    if word.lower() not in existing:
-        hint = f"{word[0]}...{word[-1]}" if len(word) > 2 else word
-        current_list.append({
-            "en": word,
-            "vi": meaning,
-            "hint": hint
-        })
-        save_vocab_for_video(video_name, current_list)
-
-def remove_single_word(video_name: str, word_en: str):
-    current_list = load_vocab_for_video(video_name)
-    filtered = [item for item in current_list if item["en"].lower() != word_en.lower()]
-    save_vocab_for_video(video_name, filtered)
-
-def remove_video_completely(video_name: str):
-    safe_name = clean_filename(video_name)
-    for ext in [".mp4", ".json", "_vocab.json", "_audio.mp3"]:
-        fp = os.path.join(MEDIA_DIR, f"{safe_name}{ext}")
-        if os.path.exists(fp):
-            try:
-                os.remove(fp)
-            except Exception:
-                pass
-
-# ================= 2. KIỂM TRA ĐÁP ÁN ĐỒNG NGHĨA =================
-def check_en_to_vi_smart(user_vi: str, target_en: str, target_vi_raw: str) -> bool:
+def check_en_to_vi_smart(user_vi: str, target_en: str, target_vi_raw: str, offline_dict: dict) -> bool:
     u_clean = clean_text(user_vi)
     if not u_clean:
         return False
     acceptable = extract_meanings(target_vi_raw)
     if u_clean in acceptable or any(u_clean in m or m in u_clean for m in acceptable if len(u_clean) >= 2):
         return True
-    offline_mean = OFFLINE_DICTIONARY.get(clean_text(target_en), "")
+    offline_mean = offline_dict.get(clean_text(target_en), "")
     if offline_mean:
         off_meanings = extract_meanings(offline_mean)
         if u_clean in off_meanings or any(u_clean in m or m in u_clean for m in off_meanings if len(u_clean) >= 2):
@@ -166,7 +81,7 @@ def check_en_to_vi_smart(user_vi: str, target_en: str, target_vi_raw: str) -> bo
         pass
     return False
 
-def check_vi_to_en_smart(user_en: str, target_vi_raw: str, original_en: str, current_words: list) -> bool:
+def check_vi_to_en_smart(user_en: str, target_vi_raw: str, original_en: str, current_words: list, offline_dict: dict) -> bool:
     u_en_clean = clean_text(user_en)
     if not u_en_clean:
         return False
@@ -178,7 +93,7 @@ def check_vi_to_en_smart(user_en: str, target_vi_raw: str, original_en: str, cur
         if any(m in target_vi_meanings for m in w_meanings):
             if u_en_clean == clean_text(w.get("en", "")):
                 return True
-    user_en_vi = OFFLINE_DICTIONARY.get(u_en_clean, "")
+    user_en_vi = offline_dict.get(u_en_clean, "")
     if user_en_vi:
         user_meanings = extract_meanings(user_en_vi)
         if any(m in target_vi_meanings or any(m in t or t in m for t in target_vi_meanings) for m in user_meanings if len(m) >= 2):
@@ -197,522 +112,801 @@ def check_vi_to_en_smart(user_en: str, target_vi_raw: str, original_en: str, cur
         pass
     return False
 
-load_offline_dictionary()
+# ================= NHẬN DIỆN MOONSHINE TRÊN MÁY TÍNH =================
+if HAVE_MOONSHINE_API:
+    class SubtitleCollector(MV_TranscriptEventListener):
+        def __init__(self):
+            super().__init__()
+            self.lines = {}
 
-# ================= 3. TRÍCH XUẤT ÂM THANH & GROQ API =================
-def extract_audio_fast(video_path: str) -> str:
-    base, _ = os.path.splitext(video_path)
-    audio_out = f"{base}_audio.mp3"
-    if os.path.exists(audio_out):
-        return audio_out
+        def _record(self, event):
+            line = getattr(event, "line", None)
+            if not line:
+                return
+            line_id = getattr(line, "id", None) or getattr(line, "line_id", None) or len(self.lines)
+            txt = getattr(line, "text", "").strip()
+            start = float(getattr(line, "start_time", 0.0))
+            dur = float(getattr(line, "duration", 0.0))
+            if txt:
+                self.lines[line_id] = {
+                    "start": round(start, 2),
+                    "end": round(start + (dur if dur > 0 else 3.5), 2),
+                    "text": txt
+                }
 
+        def on_line_started(self, event): self._record(event)
+        def on_line_text_changed(self, event): self._record(event)
+        def on_line_updated(self, event): self._record(event)
+        def on_line_completed(self, event): self._record(event)
+
+        def get_segments(self):
+            return sorted(list(self.lines.values()), key=lambda x: x["start"])
+
+def transcribe_local_moonshine(video_path: str, temp_dir: str, progress_callback=None) -> tuple:
+    if not HAVE_MOONSHINE_API:
+        raise RuntimeError("Mô hình AI chỉ chạy trên máy tính.")
+
+    wav_temp = os.path.join(temp_dir, "temp_audio_16k.wav")
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
-        "-vn", "-acodec", "libmp3lame", "-b:a", "64k",
-        audio_out
+        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        wav_temp
     ]
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return audio_out
-    except Exception:
-        return video_path
+    except FileNotFoundError:
+        raise RuntimeError("Máy tính chưa cài FFmpeg hoặc chưa thêm FFmpeg vào PATH.")
 
-def transcribe_with_groq(video_path: str, api_key: str) -> list:
-    client = Groq(api_key=api_key)
-    target_upload = extract_audio_fast(video_path)
+    segments = []
+    total_duration = 0.0
+    try:
+        with wave.open(wav_temp, "rb") as wf:
+            total_duration = round(wf.getnframes() / float(wf.getframerate()), 2)
 
-    with open(target_upload, "rb") as file_data:
-        transcription = client.audio.transcriptions.create(
-            file=(os.path.basename(target_upload), file_data.read()),
-            model="whisper-large-v3-turbo",
-            response_format="verbose_json",
-            temperature=0.0
-        )
+        model_path, model_arch = mv_get_model_for_language("en")
+        transcriber = MV_Transcriber(model_path=model_path, model_arch=model_arch)
+        collector = SubtitleCollector()
+        transcriber.add_listener(collector)
 
-    segments_data = []
-    raw_segments = getattr(transcription, "segments", []) or transcription.get("segments", [])
-    for seg in raw_segments:
-        s_start = seg.start if hasattr(seg, "start") else seg.get("start", 0.0)
-        s_end = seg.end if hasattr(seg, "end") else seg.get("end", 0.0)
-        s_text = seg.text if hasattr(seg, "text") else seg.get("text", "")
-        segments_data.append({
-            "start": float(s_start),
-            "end": float(s_end),
-            "text": str(s_text).strip()
-        })
-    return segments_data
+        audio_data, sample_rate = mv_load_wav_file(wav_temp)
+        transcriber.start()
 
-# ================= 4. SIDEBAR CẤU HÌNH =================
-with st.sidebar:
-    st.header("🔑 Cấu hình Groq API")
-    groq_api_key = st.secrets.get("GROQ_API_KEY", "") or os.environ.get("GROQ_API_KEY", "")
-    if not groq_api_key:
-        groq_api_key = st.text_input("Nhập Groq API Key:", type="password", placeholder="gsk_...")
-    else:
-        st.success("✅ Đã kết nối Groq API Key")
+        chunk_duration = 0.5
+        chunk_size = int(chunk_duration * sample_rate)
+        total = len(audio_data)
 
-    st.divider()
-    if st.button("🧹 Dọn dẹp kho video", use_container_width=True):
-        for f in os.listdir(MEDIA_DIR):
-            fp = os.path.join(MEDIA_DIR, f)
+        for i in range(0, total, chunk_size):
+            chunk = audio_data[i : i + chunk_size]
+            transcriber.add_audio(chunk, sample_rate)
+            if progress_callback and total > 0:
+                progress_callback(int((i + len(chunk)) / total * 100))
+
+        transcriber.stop()
+        segments = collector.get_segments()
+    finally:
+        if os.path.exists(wav_temp):
             try:
-                if os.path.isfile(fp) or os.path.islink(fp):
-                    os.unlink(fp)
+                os.remove(wav_temp)
             except Exception:
                 pass
-        st.session_state.pop("active_video_name", None)
-        st.rerun()
+    return segments, total_duration
 
-# ================= 5. GIAO DIỆN CHÍNH & NẠP VIDEO =================
-st.title("🎧 Học Tiếng Anh Tương Tác Qua Video")
+# ================= GIAO DIỆN ỨNG DỤNG =================
+def main(page: ft.Page):
+    page.title = "Học Tiếng Anh - Moonshine Offline"
+    page.theme_mode = ft.ThemeMode.DARK
+    page.padding = 0
+    page.window.width = 440
+    page.window.height = 860
 
-source_option = st.radio(
-    "Chọn nguồn video:",
-    ["📂 Tải video từ điện thoại/máy tính", "🔗 Dán link YouTube"],
-    horizontal=True
-)
+    app_data_dir = os.path.join(os.path.expanduser("~"), ".english_video_app")
+    os.makedirs(app_data_dir, exist_ok=True)
+    dict_path = os.path.join(app_data_dir, "offline_dict.json")
 
-if source_option == "📂 Tải video từ điện thoại/máy tính":
-    uploaded_file = st.file_uploader("Chọn file video (mp4, mkv, mov):", type=["mp4", "mkv", "mov"])
-    if uploaded_file is not None:
-        base_name = clean_filename(os.path.splitext(uploaded_file.name)[0])
-        target_path = os.path.join(MEDIA_DIR, f"{base_name}.mp4")
-        if not os.path.exists(target_path):
-            with open(target_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            st.session_state["active_video_name"] = base_name
-            st.rerun()
+    offline_dict = {}
+    if os.path.exists(dict_path):
+        try:
+            with open(dict_path, "r", encoding="utf-8") as f:
+                offline_dict = json.load(f)
+        except Exception:
+            offline_dict = {}
+    if not offline_dict:
+        offline_dict = {"hello": "xin chào", "video": "đoạn phim", "learn": "học tập", "practice": "thực hành"}
 
-elif source_option == "🔗 Dán link YouTube":
-    col_yt1, col_yt2 = st.columns([4, 1])
-    with col_yt1:
-        yt_url = st.text_input("Link YouTube:", placeholder="https://www.youtube.com/watch?v=...")
-    with col_yt2:
-        st.write("")
-        st.write("")
-        btn_yt = st.button("Tải Video", use_container_width=True)
+    def save_offline_dict():
+        try:
+            with open(dict_path, "w", encoding="utf-8") as f:
+                json.dump(offline_dict, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
-    if yt_url and btn_yt:
-        with st.spinner("Đang tải video YouTube về server..."):
+    tts_audio = ft.Audio(
+        src="https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=hello",
+        autoplay=False
+    )
+    page.overlay.append(tts_audio)
+
+    def speak(word: str):
+        clean_w = re.sub(r'[^a-zA-Z]', '', word)
+        if clean_w:
             try:
-                with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-                    info = ydl.extract_info(yt_url, download=False)
-                    raw_title = info.get('title', 'youtube_video')
-                base_name = clean_filename(raw_title)
-                target_path = os.path.join(MEDIA_DIR, f"{base_name}.mp4")
+                tts_audio.src = f"https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q={urllib.parse.quote(clean_w)}"
+                tts_audio.update()
+                tts_audio.play()
+            except Exception:
+                pass
 
-                if not os.path.exists(target_path):
-                    ydl_opts = {
-                        'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                        'outtmpl': os.path.join(MEDIA_DIR, f"{base_name}.%(ext)s"),
-                        'merge_output_format': 'mp4',
-                        'quiet': True,
-                    }
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([yt_url])
-                st.session_state["active_video_name"] = base_name
-                st.rerun()
-            except Exception as e:
-                st.error(f"Lỗi tải YouTube: {e}")
+    state = {
+        "current_video_name": "",
+        "current_video_path": "",
+        "subtitles": [],
+        "vocab_list": [],
+        "active_sub_idx": -1,
+        "current_pos_sec": 0.0,
+        "duration_sec": 0.0,
+        "is_playing": False,
+        "is_fullscreen": False,
+        "active_video_ref": None,
+        "q_en_idx": 0,
+        "q_vi_idx": 0
+    }
 
-# ================= 6. XỬ LÝ PHỤ ĐỀ GROQ =================
-if "active_video_name" in st.session_state:
-    v_name = st.session_state["active_video_name"]
-    v_path = os.path.join(MEDIA_DIR, f"{v_name}.mp4")
-    s_path = os.path.join(MEDIA_DIR, f"{v_name}.json")
-    if os.path.exists(v_path) and not os.path.exists(s_path):
-        if not groq_api_key:
-            st.warning("⚠️ Vui lòng cấu hình Groq API Key để nhận diện phụ đề.")
-        else:
-            with st.spinner("⚡ Groq Whisper đang nhận diện phụ đề (2-3 giây)..."):
+    def clean_filename(name: str) -> str:
+        name = re.sub(r'[\\/*?:"<>|]', "", name)
+        return re.sub(r'\s+', "_", name.strip())[:50]
+
+    def get_vocab_path(v_name: str) -> str:
+        return os.path.join(app_data_dir, f"{clean_filename(v_name)}_vocab.json")
+
+    def get_subs_path(v_name: str) -> str:
+        return os.path.join(app_data_dir, f"{clean_filename(v_name)}_subs.json")
+
+    def load_vocab(v_name: str):
+        p = get_vocab_path(v_name)
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        words = list(DEFAULT_SAMPLE_WORDS)
+        save_vocab(v_name, words)
+        return words
+
+    def save_vocab(v_name: str, words: list):
+        try:
+            with open(get_vocab_path(v_name), "w", encoding="utf-8") as f:
+                json.dump(words, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def add_vocab(word: str, meaning: str):
+        word, meaning = word.strip(), meaning.strip()
+        if not word or not meaning or not state["current_video_name"]:
+            return
+        words = state["vocab_list"]
+        if not any(item["en"].lower() == word.lower() for item in words):
+            hint = f"{word[0]}...{word[-1]}" if len(word) > 2 else word
+            words.append({"en": word, "vi": meaning, "hint": hint})
+            save_vocab(state["current_video_name"], words)
+            offline_dict[word.lower()] = meaning
+            save_offline_dict()
+            page.snack_bar = ft.SnackBar(ft.Text(f"Đã lưu: '{word}'!"), bgcolor=ft.Colors.GREEN_700)
+            page.snack_bar.open = True
+            refresh_vocab_ui()
+            page.update()
+
+    # ================= DIALOG TRA TỪ =================
+    def open_lookup_dialog(word: str):
+        target = re.sub(r'[^a-zA-Z]', '', word).lower()
+        if not target:
+            return
+        speak(target)
+
+        word_title = ft.Text(target.capitalize(), size=22, weight=ft.FontWeight.BOLD, color=ft.Colors.AMBER)
+        meaning_text = ft.Text("⏳ Đang tra nghĩa...", size=16, color=ft.Colors.WHITE)
+        source_badge = ft.Container(
+            content=ft.Text("Online", size=11, weight=ft.FontWeight.BOLD),
+            padding=ft.padding.symmetric(horizontal=6, vertical=2),
+            bgcolor=ft.Colors.BLUE_700,
+            border_radius=4
+        )
+
+        def save_and_close(e):
+            add_vocab(target, meaning_text.value)
+            dialog.open = False
+            page.update()
+
+        btn_save = ft.ElevatedButton("➕ Lưu từ vào bài học", on_click=save_and_close, visible=False)
+
+        dialog = ft.AlertDialog(
+            title=ft.Row([
+                ft.Row([word_title, source_badge], spacing=8),
+                ft.IconButton(ft.Icons.VOLUME_UP, on_click=lambda _: speak(target), icon_color=ft.Colors.LIGHT_BLUE)
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            content=ft.Column([
+                meaning_text,
+                ft.Container(height=8),
+                btn_save
+            ], tight=True, spacing=6),
+            actions=[
+                ft.TextButton("Đóng", on_click=lambda _: setattr(dialog, "open", False) or page.update())
+            ]
+        )
+        page.dialog = dialog
+        dialog.open = True
+        page.update()
+
+        def fetch_meaning():
+            if target in offline_dict:
+                meaning = offline_dict[target]
+                source_badge.content.value = "Offline"
+                source_badge.bgcolor = ft.Colors.GREEN_700
+            else:
                 try:
-                    segments_data = transcribe_with_groq(v_path, groq_api_key)
-                    with open(s_path, "w", encoding="utf-8") as f:
-                        json.dump(segments_data, f, ensure_ascii=False, indent=2)
-                    st.success("Tạo phụ đề hoàn tất!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Lỗi Whisper API: {e}")
+                    res = requests.get(f"https://api.mymemory.translated.net/get?q={target}&langpair=en|vi", timeout=3).json()
+                    meaning = res.get("responseData", {}).get("translatedText", "Không tìm thấy nghĩa.")
+                except Exception:
+                    meaning = "Lỗi kết nối mạng khi tra từ."
 
-# ================= 7. HIỂN THỊ TRÌNH PHÁT VIDEO VÀ BÀI ÔN =================
-all_ready_videos = {}
-for f in os.listdir(MEDIA_DIR):
-    if f.endswith(".json") and not f.endswith("_vocab.json"):
-        v_base = f[:-5]
-        v_file = os.path.join(MEDIA_DIR, f"{v_base}.mp4")
-        if os.path.exists(v_file):
+            meaning_text.value = meaning
+            btn_save.visible = bool(meaning and "lỗi" not in meaning.lower())
+            page.update()
+
+        threading.Thread(target=fetch_meaning, daemon=True).start()
+
+    # ================= KHUNG VIDEO & PHỤ ĐỀ TRÊN VIDEO =================
+    sub_chips_row = ft.Row(
+        wrap=True,
+        alignment=ft.MainAxisAlignment.CENTER,
+        spacing=6,
+        run_spacing=4
+    )
+    sub_time_badge = ft.Text("[00:00]", size=12, color=ft.Colors.AMBER_300, weight=ft.FontWeight.BOLD)
+
+    overlay_sub_box = ft.Container(
+        content=ft.Column(
+            controls=[
+                ft.Row([sub_time_badge, ft.Text("Chạm chữ để tra từ", size=11, color=ft.Colors.GREY_300)], alignment=ft.MainAxisAlignment.CENTER),
+                sub_chips_row
+            ],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            tight=True,
+            spacing=3
+        ),
+        bgcolor=ft.Colors.BLACK87,
+        border_radius=10,
+        padding=ft.padding.symmetric(horizontal=12, vertical=6),
+        alignment=ft.alignment.center,
+        border=ft.border.all(1.5, ft.Colors.AMBER_400),
+        visible=True
+    )
+
+    status_label = ft.Text("Chưa chọn video", size=13, color=ft.Colors.GREY_400, text_align=ft.TextAlign.CENTER)
+    loading_ring = ft.ProgressRing(visible=False, width=20, height=20, stroke_width=2)
+    transcript_col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=6)
+
+    def render_subtitle_chips(text: str, time_str: str = ""):
+        sub_chips_row.controls.clear()
+        if time_str:
+            sub_time_badge.value = time_str
+        for w in text.split():
+            clean_w = re.sub(r'[^a-zA-Z0-9]', '', w)
+            if not clean_w:
+                continue
+            btn = ft.Container(
+                content=ft.Text(
+                    w,
+                    size=20 if state["is_fullscreen"] else 16,
+                    weight=ft.FontWeight.BOLD,
+                    color=ft.Colors.WHITE
+                ),
+                padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                bgcolor=ft.Colors.BLUE_GREY_900,
+                border=ft.border.all(1, ft.Colors.AMBER_300),
+                border_radius=6,
+                ink=True,
+                on_click=lambda e, target=clean_w: open_lookup_dialog(target)
+            )
+            sub_chips_row.controls.append(btn)
+        page.update()
+
+    def highlight_transcript(active_idx: int):
+        for idx, ctrl in enumerate(transcript_col.controls):
+            if isinstance(ctrl, ft.Container):
+                is_active = (idx == active_idx)
+                ctrl.bgcolor = ft.Colors.BLUE_900 if is_active else ft.Colors.WHITE10
+        page.update()
+
+    def get_best_subtitle_index(cur_sec: float) -> int:
+        subs = state["subtitles"]
+        if not subs:
+            return -1
+        for idx, seg in enumerate(subs):
+            if seg["start"] <= cur_sec <= seg["end"] + 0.6:
+                return idx
+        for idx in range(len(subs) - 1, -1, -1):
+            if cur_sec >= subs[idx]["start"]:
+                return idx
+        return 0
+
+    def check_and_update_subtitle(cur_sec: float, force: bool = False):
+        subs = state["subtitles"]
+        if not subs:
+            return
+
+        target_idx = get_best_subtitle_index(cur_sec)
+        if target_idx != -1 and (force or state["active_sub_idx"] != target_idx):
+            state["active_sub_idx"] = target_idx
+            m, s = int(subs[target_idx]["start"] // 60), int(subs[target_idx]["start"] % 60)
+            render_subtitle_chips(subs[target_idx]["text"], f"[{m:02d}:{s:02d}]")
+            highlight_transcript(target_idx)
+
+    time_display = ft.Text("00:00 / 00:00", size=12, color=ft.Colors.GREY_300)
+    time_slider = ft.Slider(min=0, max=100, value=0, expand=True)
+
+    def on_slider_change(e):
+        seek_to_sec(float(e.control.value))
+
+    time_slider.on_change = on_slider_change
+
+    def seek_to_sec(sec: float):
+        sec = max(0.0, min(sec, state["duration_sec"] if state["duration_sec"] > 0 else 9999.0))
+        state["current_pos_sec"] = sec
+        ms = int(sec * 1000)
+        vp = state["active_video_ref"]
+        if vp:
             try:
-                with open(os.path.join(MEDIA_DIR, f), "r", encoding="utf-8") as jf:
-                    subs_content = json.load(jf)
-                    if isinstance(subs_content, list) and len(subs_content) > 0:
-                        all_ready_videos[v_base] = {
-                            # Đường dẫn tĩnh tương đối hỗ trợ HTTPS hoàn hảo trên Streamlit Cloud
-                            "url": f"app/static/{urllib.parse.quote(v_base + '.mp4')}",
-                            "subs": subs_content
-                        }
+                if hasattr(vp, "seek"):
+                    vp.seek(ms)
+                elif hasattr(vp, "seek_position"):
+                    vp.seek_position(ms)
             except Exception:
                 pass
+        update_time_label()
+        check_and_update_subtitle(sec, force=True)
 
-if all_ready_videos:
-    video_list = list(all_ready_videos.keys())
-    if "active_video_name" not in st.session_state or st.session_state["active_video_name"] not in video_list:
-        st.session_state["active_video_name"] = video_list[0]
+    def update_time_label():
+        c_m, c_s = int(state["current_pos_sec"] // 60), int(state["current_pos_sec"] % 60)
+        d_m, d_s = int(state["duration_sec"] // 60), int(state["duration_sec"] % 60)
+        time_display.value = f"{c_m:02d}:{c_s:02d} / {d_m:02d}:{d_s:02d}"
+        if state["duration_sec"] > 0:
+            time_slider.value = min(state["current_pos_sec"], state["duration_sec"])
+        page.update()
 
-    col_v1, col_v2 = st.columns([5, 1.5])
-    with col_v1:
-        selected_vid = st.selectbox(
-            "Chọn video học tập:",
-            video_list,
-            index=video_list.index(st.session_state["active_video_name"])
+    def toggle_play(e=None):
+        vp = state["active_video_ref"]
+        if not vp:
+            return
+        try:
+            if state["is_playing"]:
+                vp.pause()
+                play_btn.icon = ft.Icons.PLAY_ARROW
+                state["is_playing"] = False
+            else:
+                vp.play()
+                play_btn.icon = ft.Icons.PAUSE
+                state["is_playing"] = True
+            page.update()
+        except Exception:
+            pass
+
+    play_btn = ft.IconButton(ft.Icons.PAUSE, icon_size=30, icon_color=ft.Colors.AMBER, on_click=toggle_play)
+
+    def jump_sentence(delta: int):
+        subs = state["subtitles"]
+        if not subs:
+            return
+        new_idx = max(0, min(len(subs) - 1, state["active_sub_idx"] + delta))
+        seek_to_sec(subs[new_idx]["start"])
+
+    def toggle_fullscreen(e):
+        state["is_fullscreen"] = not state["is_fullscreen"]
+        if state["is_fullscreen"]:
+            video_container.height = None
+            video_container.expand = True
+            btn_fs.icon = ft.Icons.FULLSCREEN_EXIT
+            page.navigation_bar.visible = False
+            transcript_section.visible = False
+            top_bar.visible = False
+        else:
+            video_container.height = 240
+            video_container.expand = False
+            btn_fs.icon = ft.Icons.FULLSCREEN
+            page.navigation_bar.visible = True
+            transcript_section.visible = True
+            top_bar.visible = True
+
+        if 0 <= state["active_sub_idx"] < len(state["subtitles"]):
+            cur = state["subtitles"][state["active_sub_idx"]]
+            render_subtitle_chips(cur["text"])
+        page.update()
+
+    btn_fs = ft.IconButton(
+        icon=ft.Icons.FULLSCREEN,
+        icon_color=ft.Colors.WHITE,
+        bgcolor=ft.Colors.BLACK54,
+        on_click=toggle_fullscreen
+    )
+
+    video_container = ft.Container(
+        content=ft.Text("Chưa chọn video", color=ft.Colors.GREY_500),
+        height=240,
+        bgcolor=ft.Colors.BLACK,
+        border_radius=8,
+        alignment=ft.alignment.center
+    )
+
+    controls_bar = ft.Column([
+        ft.Row([time_slider, time_display], spacing=8),
+        ft.Row(
+            controls=[
+                ft.TextButton("⏮ Câu trước", on_click=lambda _: jump_sentence(-1)),
+                ft.IconButton(ft.Icons.REPLAY_5, on_click=lambda _: seek_to_sec(state["current_pos_sec"] - 5)),
+                play_btn,
+                ft.IconButton(ft.Icons.FORWARD_5, on_click=lambda _: seek_to_sec(state["current_pos_sec"] + 5)),
+                ft.TextButton("Câu sau ⏭", on_click=lambda _: jump_sentence(1)),
+            ],
+            alignment=ft.MainAxisAlignment.CENTER
         )
-        if selected_vid != st.session_state["active_video_name"]:
-            st.session_state["active_video_name"] = selected_vid
-            st.rerun()
-    with col_v2:
-        st.write("")
-        st.write("")
-        if st.button("🗑️ Xóa video này", use_container_width=True):
-            remove_video_completely(selected_vid)
-            st.session_state.pop("active_video_name", None)
-            st.rerun()
+    ], spacing=0)
 
-    default_vid = st.session_state["active_video_name"]
-    all_data_json = json.dumps(all_ready_videos, ensure_ascii=False)
-    offline_dict_json = json.dumps(OFFLINE_DICTIONARY, ensure_ascii=False)
+    def playback_ticker():
+        while True:
+            time.sleep(0.25)
+            if state["is_playing"] and state["active_video_ref"]:
+                state["current_pos_sec"] += 0.25
+                if state["duration_sec"] > 0 and state["current_pos_sec"] >= state["duration_sec"]:
+                    state["current_pos_sec"] = state["duration_sec"]
+                    state["is_playing"] = False
+                    play_btn.icon = ft.Icons.PLAY_ARROW
 
-    tab_watch, tab_vocab = st.tabs(["🎬 Xem video & Phụ đề tương tác", "📝 Ôn tập từ vựng"])
+                update_time_label()
+                check_and_update_subtitle(state["current_pos_sec"])
 
-    with tab_watch:
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            * {{ box-sizing: border-box; }}
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                background-color: #0f172a;
-                margin: 0;
-                padding: 6px;
-                color: #f8fafc;
-            }}
-            .main-layout {{
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-                max-width: 1000px;
-                margin: 0 auto;
-            }}
-            .video-container {{
-                position: relative;
-                width: 100%;
-                background-color: #000000;
-                border-radius: 10px;
-                overflow: hidden;
-            }}
-            video {{
-                width: 100%;
-                max-height: 70vh;
-                display: block;
-                background: #000;
-            }}
-            .sub-overlay-box {{
-                position: absolute;
-                left: 50%;
-                bottom: 45px;
-                transform: translateX(-50%);
-                width: 90%;
-                text-align: center;
-                background: rgba(15, 23, 42, 0.90);
-                border: 1px solid rgba(255, 255, 255, 0.25);
-                backdrop-filter: blur(6px);
-                color: #ffffff;
-                padding: 8px 12px;
-                border-radius: 8px;
-                font-size: 19px;
-                line-height: 1.5;
-                z-index: 50;
-            }}
-            .word-item {{
-                display: inline-block;
-                margin: 0 2px;
-                padding: 1px 4px;
-                border-radius: 4px;
-                cursor: pointer;
-                color: #ffffff;
-            }}
-            .word-item:hover, .word-item:active {{
-                background-color: #facc15;
-                color: #0f172a;
-                font-weight: bold;
-            }}
-            #dict-popup {{
-                position: absolute;
-                display: none;
-                z-index: 100;
-                background: #1e293b;
-                color: #ffffff;
-                padding: 12px 16px;
-                border-radius: 10px;
-                border: 2px solid #38bdf8;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.8);
-                font-size: 15px;
-                max-width: 320px;
-                min-width: 220px;
-            }}
-            #dict-popup .header {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                border-bottom: 1px solid #334155;
-                padding-bottom: 4px;
-                margin-bottom: 6px;
-            }}
-            #dict-popup .word-title {{
-                font-weight: bold;
-                font-size: 18px;
-                color: #facc15;
-            }}
-            #dict-popup .btn-speak {{
-                background: #0284c7;
-                border: none;
-                color: white;
-                border-radius: 4px;
-                padding: 4px 8px;
-                cursor: pointer;
-                font-size: 12px;
-            }}
-            .transcript-card {{
-                background: #ffffff;
-                border-radius: 8px;
-                padding: 12px;
-                color: #1e293b;
-            }}
-            .transcript-scroll {{
-                height: 160px;
-                overflow-y: auto;
-            }}
-            .sub-line {{
-                padding: 4px 8px;
-                margin-bottom: 3px;
-                border-radius: 4px;
-                font-size: 15px;
-            }}
-            .sub-line.active {{
-                background-color: #e0f2fe;
-                font-weight: 600;
-            }}
-            .time-badge {{
-                color: #0284c7;
-                background: #f1f5f9;
-                font-size: 11px;
-                padding: 2px 4px;
-                border-radius: 3px;
-                cursor: pointer;
-                margin-right: 6px;
-            }}
-        </style>
-        </head>
-        <body>
-        <div class="main-layout">
-            <div class="video-container" id="video-container">
-                <video id="main-video" controls playsinline preload="auto"></video>
-                <div class="sub-overlay-box" id="sub-overlay">
-                    <span class="sub-text-content">▶ Bấm phát video để học</span>
-                </div>
-                <div id="dict-popup">
-                    <div class="header">
-                        <span class="word-title" id="pop-word">Word</span>
-                        <button class="btn-speak" onclick="speakCurrentWord()">🔊 Đọc</button>
-                    </div>
-                    <div id="pop-meaning">Đang tra nghĩa...</div>
-                </div>
-            </div>
-            <div class="transcript-card">
-                <div style="font-weight:600; margin-bottom: 6px;">📜 Lời thoại đầy đủ:</div>
-                <div class="transcript-scroll" id="transcript-scroll-box"></div>
-            </div>
-        </div>
+    threading.Thread(target=playback_ticker, daemon=True).start()
 
-        <script>
-        const allVideos = {all_data_json};
-        const OFFLINE_DICT = {offline_dict_json};
-        let currentVideoName = "{default_vid}";
-        let video, overlay, scrollBox, lines = [];
-        let currentWordToSpeak = "";
+    def build_transcript_list():
+        transcript_col.controls.clear()
+        if not state["subtitles"]:
+            transcript_col.controls.append(ft.Text("Chưa có phụ đề.", color=ft.Colors.GREY_500))
+            page.update()
+            return
 
-        function initApp() {{
-            video = document.getElementById('main-video');
-            overlay = document.getElementById('sub-overlay');
-            scrollBox = document.getElementById('transcript-scroll-box');
+        for idx, seg in enumerate(state["subtitles"]):
+            start_sec = float(seg.get("start", 0.0))
+            m, s = int(start_sec // 60), int(start_sec % 60)
+            t_badge = f"[{m:02d}:{s:02d}]"
+            text_str = str(seg.get("text", "")).strip()
 
-            video.addEventListener('timeupdate', () => {{
-                const cur = video.currentTime;
-                let activeLineFound = false;
-                lines.forEach((line) => {{
-                    const start = parseFloat(line.getAttribute('data-start'));
-                    const end = parseFloat(line.getAttribute('data-end'));
-                    if (cur >= start && cur <= end) {{
-                        if (!line.classList.contains('active')) {{
-                            lines.forEach(l => l.classList.remove('active'));
-                            line.classList.add('active');
-                            scrollBox.scrollTo({{
-                                top: line.offsetTop - scrollBox.offsetTop - 40,
-                                behavior: 'smooth'
-                            }});
-                            overlay.querySelector('.sub-text-content').innerHTML = line.querySelector('.line-text').innerHTML;
-                        }}
-                        activeLineFound = true;
-                    }}
-                }});
-                if (!activeLineFound && cur > 0) {{
-                    overlay.querySelector('.sub-text-content').innerHTML = "<span style='opacity:0.4;'>...</span>";
-                }}
-            }});
+            def make_click(s_time=start_sec):
+                return lambda _: (
+                    seek_to_sec(s_time),
+                    check_and_update_subtitle(s_time, force=True)
+                )
 
-            document.addEventListener('click', (e) => {{
-                const popup = document.getElementById('dict-popup');
-                if (popup && !popup.contains(e.target) && !e.target.classList.contains('word-item')) {{
-                    popup.style.display = 'none';
-                }}
-            }});
+            item = ft.Container(
+                content=ft.Row([
+                    ft.Text(t_badge, size=13, color=ft.Colors.LIGHT_BLUE_ACCENT, weight=ft.FontWeight.BOLD),
+                    ft.Text(text_str, size=15, color=ft.Colors.WHITE, expand=True)
+                ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                padding=ft.padding.symmetric(horizontal=10, vertical=8),
+                border_radius=8,
+                bgcolor=ft.Colors.WHITE10,
+                ink=True,
+                on_click=make_click(start_sec)
+            )
+            transcript_col.controls.append(item)
+        page.update()
 
-            setupVideo(currentVideoName);
-        }}
+    def process_subtitles_moonshine(video_path: str, v_name: str):
+        loading_ring.visible = True
+        status_label.value = "🌙 Moonshine đang nhận diện offline..."
+        page.update()
 
-        function setupVideo(name) {{
-            const vidData = allVideos[name];
-            if (!vidData) return;
+        def on_prog(percent):
+            status_label.value = f"🌙 Moonshine Offline: {percent}%"
+            page.update()
 
-            let subHtml = "";
-            if (vidData.subs) {{
-                vidData.subs.forEach((seg, idx) => {{
-                    const m = String(Math.floor(seg.start / 60)).padStart(2, '0');
-                    const s = String(Math.floor(seg.start % 60)).padStart(2, '0');
-                    const timeBadge = `<span class='time-badge' onclick="video.currentTime=${{seg.start}};video.play();">[${{m}}:${{s}}]</span>`;
+        try:
+            subs_data, dur = transcribe_local_moonshine(video_path, app_data_dir, progress_callback=on_prog)
+            if dur <= 0 and subs_data:
+                dur = float(subs_data[-1].get("end", 0.0)) + 3.0
 
-                    let words = "";
-                    seg.text.trim().split(/\s+/).forEach(w => {{
-                        const clean = w.replace(/[^a-zA-Z0-9]/g, "");
-                        if (clean) {{
-                            words += `<span class='word-item' onclick="lookupWord(event, '${{clean}}')">${{w}}</span> `;
-                        }} else {{
-                            words += w + " ";
-                        }}
-                    }});
-                    subHtml += `<div class='sub-line' data-start='${{seg.start}}' data-end='${{seg.end}}'>${{timeBadge}}<span class='line-text'>${{words}}</span></div>`;
-                }});
-            }}
+            with open(get_subs_path(v_name), "w", encoding="utf-8") as f:
+                json.dump({"duration": dur, "segments": subs_data}, f, ensure_ascii=False, indent=2)
 
-            scrollBox.innerHTML = subHtml;
-            lines = document.querySelectorAll('.sub-line');
-            video.src = vidData.url;
-            video.load();
-        }}
+            state["subtitles"] = subs_data
+            state["duration_sec"] = dur
+            time_slider.max = dur if dur > 0 else 100
 
-        function speakCurrentWord() {{
-            if ('speechSynthesis' in window && currentWordToSpeak) {{
-                const utterance = new SpeechSynthesisUtterance(currentWordToSpeak);
-                utterance.lang = 'en-US';
-                window.speechSynthesis.speak(utterance);
-            }}
-        }}
+            if len(subs_data) == 0:
+                status_label.value = "⚠️ Video không có giọng nói tiếng Anh."
+            else:
+                status_label.value = f"✅ Hoàn tất! Đã nạp {len(subs_data)} câu phụ đề."
+                build_transcript_list()
+                seek_to_sec(0)
+        except Exception as err:
+            status_label.value = f"❌ Lỗi: {str(err)}"
+        finally:
+            loading_ring.visible = False
+            page.update()
 
-        async function lookupWord(event, word) {{
-            event.stopPropagation();
-            currentWordToSpeak = word;
-            const popup = document.getElementById('dict-popup');
-            const popWord = document.getElementById('pop-word');
-            const popMeaning = document.getElementById('pop-meaning');
+    def load_selected_video(file_path: str, name: str):
+        state["current_video_name"] = name
+        state["current_video_path"] = file_path
+        state["vocab_list"] = load_vocab(name)
+        state["current_pos_sec"] = 0.0
+        state["active_sub_idx"] = -1
+        state["is_playing"] = True
+        play_btn.icon = ft.Icons.PAUSE
 
-            popup.style.display = 'block';
-            popup.style.left = '20px';
-            popup.style.top = '30px';
-            popWord.innerText = word;
-            popMeaning.innerText = "⏳ Đang tra nghĩa...";
-            speakCurrentWord();
+        new_video = ft.Video(
+            playlist=[ft.VideoMedia(file_path)],
+            aspect_ratio=16/9,
+            fill_color=ft.Colors.BLACK,
+            volume=100,
+            autoplay=True,
+            show_controls=False
+        )
+        state["active_video_ref"] = new_video
 
-            const wLower = word.toLowerCase();
-            if (OFFLINE_DICT[wLower]) {{
-                popMeaning.innerText = OFFLINE_DICT[wLower];
-                return;
-            }}
+        video_stack = ft.Stack(
+            controls=[
+                new_video,
+                ft.Container(
+                    content=overlay_sub_box,
+                    bottom=12,
+                    left=10,
+                    right=10,
+                    alignment=ft.alignment.center
+                ),
+                ft.Container(
+                    content=btn_fs,
+                    top=8,
+                    right=8
+                )
+            ]
+        )
+        video_container.content = video_stack
+        page.update()
 
-            try {{
-                const res = await fetch(`https://api.mymemory.translated.net/get?q=${{encodeURIComponent(word)}}&langpair=en|vi`);
-                const data = await res.json();
-                if (data && data.responseData && data.responseData.translatedText) {{
-                    popMeaning.innerText = data.responseData.translatedText;
-                    return;
-                }}
-            }} catch(e) {{}}
+        # 1. Kiểm tra file phụ đề nội bộ trong app
+        subs_file = get_subs_path(name)
+        # 2. Hoặc file .json nằm cùng thư mục ngoài với video
+        external_json = os.path.splitext(file_path)[0] + ".json"
+        target_sub_file = subs_file if os.path.exists(subs_file) else (external_json if os.path.exists(external_json) else None)
 
-            popMeaning.innerText = "Không tìm thấy nghĩa.";
-        }}
+        subs_loaded = False
+        if target_sub_file:
+            try:
+                with open(target_sub_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        state["subtitles"] = data.get("segments", [])
+                        state["duration_sec"] = float(data.get("duration", 0.0))
+                    elif isinstance(data, list):
+                        state["subtitles"] = data
+                        state["duration_sec"] = 0.0
+                subs_loaded = True
+            except Exception:
+                state["subtitles"] = []
 
-        initApp();
-        </script>
-        </body>
-        </html>
-        """
-        components.html(html_content, height=650, scrolling=False)
+        if subs_loaded and state["subtitles"]:
+            if state["duration_sec"] <= 0:
+                last_end = float(state["subtitles"][-1].get("end", 0.0))
+                state["duration_sec"] = last_end + 3.0
 
-    with tab_vocab:
-        st.subheader(f"🎯 Ôn tập từ vựng: `{default_vid}`")
-        current_words = load_vocab_for_video(default_vid)
+            time_slider.max = state["duration_sec"] if state["duration_sec"] > 0 else 100
+            status_label.value = f"✅ Đã nạp {len(state['subtitles'])} câu phụ đề."
+            build_transcript_list()
+            seek_to_sec(0.0)
+        else:
+            if HAVE_MOONSHINE_API:
+                threading.Thread(target=process_subtitles_moonshine, args=(file_path, name), daemon=True).start()
+            else:
+                status_label.value = "ℹ️ Hãy để file phụ đề .json cùng tên với video."
+                state["subtitles"] = []
+                build_transcript_list()
 
-        with st.expander("➕ Thêm từ vựng mới vào bài học này"):
-            c_add1, c_add2 = st.columns(2)
-            new_w = c_add1.text_input("Từ tiếng Anh:")
-            new_m = c_add2.text_input("Nghĩa tiếng Việt:")
-            if st.button("Lưu từ"):
-                if new_w and new_m:
-                    add_vocab_entry(default_vid, new_w, new_m)
-                    st.success("Đã thêm từ thành công!")
-                    st.rerun()
+        refresh_vocab_ui()
+        page.update()
 
-        with st.expander("📋 Danh sách từ vựng hiện có", expanded=False):
-            for idx, item in enumerate(list(current_words)):
-                c1, c2, c3 = st.columns([2, 4, 1])
-                c1.markdown(f"**{item['en']}**")
-                c2.write(f": {item['vi']}")
-                if c3.button("🗑️", key=f"del_{item['en']}_{idx}"):
-                    remove_single_word(default_vid, item["en"])
-                    st.rerun()
+    def on_file_picked(e: ft.FilePickerResultEvent):
+        if e.files and len(e.files) > 0:
+            f = e.files[0]
+            load_selected_video(f.path, f.name)
 
-        st.divider()
-        k_en_idx = f"rand_en_{default_vid}"
-        k_vi_idx = f"rand_vi_{default_vid}"
+    file_picker = ft.FilePicker(on_result=on_file_picked)
+    page.overlay.append(file_picker)
 
-        if k_en_idx not in st.session_state or st.session_state[k_en_idx] >= len(current_words):
-            st.session_state[k_en_idx] = random.randint(0, len(current_words) - 1)
-        if k_vi_idx not in st.session_state or st.session_state[k_vi_idx] >= len(current_words):
-            st.session_state[k_vi_idx] = random.randint(0, len(current_words) - 1)
+    # ================= GIAO DIỆN ÔN TẬP TỪ VỰNG =================
+    quiz_area = ft.Column(spacing=14)
+    saved_vocab_col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=6)
 
-        w_en = current_words[st.session_state[k_en_idx]]
-        w_vi = current_words[st.session_state[k_vi_idx]]
+    def refresh_vocab_ui():
+        v_list = state["vocab_list"]
+        saved_vocab_col.controls.clear()
+        if not v_list:
+            saved_vocab_col.controls.append(ft.Text("Chưa có từ vựng nào.", color=ft.Colors.GREY_500))
+        else:
+            for item in list(v_list):
+                def del_word(e, w_en=item["en"]):
+                    state["vocab_list"] = [x for x in state["vocab_list"] if x["en"] != w_en]
+                    save_vocab(state["current_video_name"], state["vocab_list"])
+                    refresh_vocab_ui()
+                    page.update()
 
-        col_q1, col_q2 = st.columns(2)
-        with col_q1:
-            st.markdown("#### 🇬🇧 ➔ 🇻🇳 Dịch sang Tiếng Việt")
-            st.info(f"Từ: **{w_en['en']}**")
-            with st.form(f"f_en_{w_en['en']}"):
-                ans_vi = st.text_input("Nghĩa tiếng Việt:")
-                if st.form_submit_button("Kiểm tra", use_container_width=True):
-                    if check_en_to_vi_smart(ans_vi, w_en['en'], w_en['vi']):
-                        st.success(f"🎉 Chính xác! Đáp án chuẩn: {w_en['vi']}")
-                    else:
-                        st.error(f"❌ Chưa đúng! Đáp án: {w_en['vi']}")
+                card = ft.Container(
+                    content=ft.Row([
+                        ft.Column([
+                            ft.Text(item["en"], size=16, weight=ft.FontWeight.BOLD),
+                            ft.Text(item["vi"], size=13, color=ft.Colors.GREY_400)
+                        ], expand=True),
+                        ft.IconButton(ft.Icons.VOLUME_UP, on_click=lambda _, w=item["en"]: speak(w), icon_size=20),
+                        ft.IconButton(ft.Icons.DELETE_OUTLINE, on_click=del_word, icon_color=ft.Colors.RED_400, icon_size=20)
+                    ]),
+                    padding=10,
+                    bgcolor=ft.Colors.WHITE10,
+                    border_radius=8
+                )
+                saved_vocab_col.controls.append(card)
 
-        with col_q2:
-            st.markdown("#### 🇻🇳 ➔ 🇬🇧 Dịch sang Tiếng Anh")
-            st.warning(f"Nghĩa: **{w_vi['vi']}** (Gợi ý: `{w_vi['hint']}`)")
-            with st.form(f"f_vi_{w_vi['en']}"):
-                ans_en = st.text_input("Từ tiếng Anh:")
-                if st.form_submit_button("Kiểm tra", use_container_width=True):
-                    if check_vi_to_en_smart(ans_en, w_vi['vi'], w_vi['en'], current_words):
-                        st.success(f"🎉 Rất tốt! Đáp án: {w_vi['en']}")
-                    else:
-                        st.error(f"❌ Chưa đúng! Đáp án: {w_vi['en']}")
+        if v_list:
+            state["q_en_idx"] = random.randint(0, len(v_list) - 1)
+            state["q_vi_idx"] = random.randint(0, len(v_list) - 1)
+            render_quiz_cards()
+        else:
+            quiz_area.controls = [ft.Text("Cần ít nhất 1 từ vựng để ôn tập.", color=ft.Colors.GREY_500)]
+        page.update()
+
+    def render_quiz_cards():
+        v_list = state["vocab_list"]
+        if not v_list:
+            return
+        w_en = v_list[state["q_en_idx"] % len(v_list)]
+        w_vi = v_list[state["q_vi_idx"] % len(v_list)]
+
+        res_en_text = ft.Text("", size=13)
+        def check_en(e):
+            if check_en_to_vi_smart(ans_en_input.value, w_en["en"], w_en["vi"], offline_dict):
+                res_en_text.value = f"🎉 Đúng! Chuẩn: {w_en['vi']}"
+                res_en_text.color = ft.Colors.GREEN_400
+            else:
+                res_en_text.value = f"❌ Sai! Gợi ý: {w_en['vi']}"
+                res_en_text.color = ft.Colors.RED_400
+            page.update()
+
+        ans_en_input = ft.TextField(hint_text="Nghĩa tiếng Việt...", text_size=14, dense=True, on_submit=check_en)
+
+        card_en = ft.Container(
+            content=ft.Column([
+                ft.Text("🇬🇧 ➔ 🇻🇳 Dịch sang Tiếng Việt", size=13, color=ft.Colors.LIGHT_BLUE_200, weight=ft.FontWeight.BOLD),
+                ft.Row([
+                    ft.Text(w_en["en"], size=22, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
+                    ft.IconButton(ft.Icons.VOLUME_UP, on_click=lambda _: speak(w_en["en"]), icon_color=ft.Colors.AMBER)
+                ]),
+                ans_en_input,
+                ft.Row([
+                    ft.ElevatedButton("Kiểm tra", on_click=check_en),
+                    ft.TextButton("Xem đáp án", on_click=lambda _: setattr(res_en_text, "value", f"Đáp án: {w_en['vi']}") or page.update()),
+                    ft.TextButton("Từ khác ➡️", on_click=lambda _: refresh_vocab_ui())
+                ]),
+                res_en_text
+            ], spacing=6),
+            padding=12,
+            bgcolor=ft.Colors.BLUE_GREY_900,
+            border_radius=10
+        )
+
+        res_vi_text = ft.Text("", size=13)
+        def check_vi(e):
+            if check_vi_to_en_smart(ans_vi_input.value, w_vi["vi"], w_vi["en"], v_list, offline_dict):
+                res_vi_text.value = f"🎉 Xuất sắc! Từ: {w_vi['en']}"
+                res_vi_text.color = ft.Colors.GREEN_400
+            else:
+                res_vi_text.value = f"❌ Chưa đúng! Từ gốc: {w_vi['en']}"
+                res_vi_text.color = ft.Colors.RED_400
+            page.update()
+
+        ans_vi_input = ft.TextField(hint_text="Từ tiếng Anh...", text_size=14, dense=True, on_submit=check_vi)
+
+        card_vi = ft.Container(
+            content=ft.Column([
+                ft.Text("🇻🇳 ➔ 🇬🇧 Dịch sang Tiếng Anh", size=13, color=ft.Colors.AMBER_200, weight=ft.FontWeight.BOLD),
+                ft.Text(w_vi["vi"], size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
+                ft.Text(f"Gợi ý: {w_vi['hint']}", size=12, color=ft.Colors.YELLOW_600),
+                ans_vi_input,
+                ft.Row([
+                    ft.ElevatedButton("Kiểm tra", on_click=check_vi),
+                    ft.TextButton("Xem đáp án", on_click=lambda _: setattr(res_vi_text, "value", f"Đáp án: {w_vi['en']}") or page.update()),
+                    ft.TextButton("Từ khác ➡️", on_click=lambda _: refresh_vocab_ui())
+                ]),
+                res_vi_text
+            ], spacing=6),
+            padding=12,
+            bgcolor=ft.Colors.BROWN_900,
+            border_radius=10
+        )
+
+        quiz_area.controls = [card_en, card_vi]
+        page.update()
+
+    # ================= TAB CÀI ĐẶT =================
+    settings_view = ft.Container(
+        content=ft.Column([
+            ft.Text("🌙 Trạng Thái Ứng Dụng", size=16, weight=ft.FontWeight.BOLD),
+            ft.Text("• Phiên bản: 1.0.0 Mobile Ready", size=14, color=ft.Colors.GREEN_400),
+            ft.Text("• Hỗ trợ phát video kèm phụ đề tương tác", size=14, color=ft.Colors.LIGHT_BLUE_200),
+            ft.Text("• Tra từ điển & Lưu sổ tay từ vựng học tập", size=14, color=ft.Colors.AMBER_200),
+            ft.Divider(height=20),
+            ft.Text(f"Thư mục lưu trữ: {app_data_dir}", size=11, color=ft.Colors.GREY_500)
+        ], spacing=10),
+        padding=16
+    )
+
+    top_bar = ft.Container(
+        content=ft.ElevatedButton(
+            "📂 Mở video trong máy",
+            icon=ft.Icons.FILE_OPEN,
+            on_click=lambda _: file_picker.pick_files(allow_multiple=False, file_type=ft.FilePickerFileType.VIDEO),
+            width=float("inf")
+        ),
+        padding=ft.padding.symmetric(horizontal=12, vertical=6)
+    )
+
+    transcript_section = ft.Container(
+        content=ft.Column([
+            ft.Text("📜 Phụ đề đầy đủ (Bấm câu để tua và tra từ):", size=13, weight=ft.FontWeight.BOLD, color=ft.Colors.GREY_400),
+            ft.Container(content=transcript_col, height=220)
+        ]),
+        padding=10
+    )
+
+    watch_view = ft.Column([
+        top_bar,
+        ft.Row([loading_ring, status_label], alignment=ft.MainAxisAlignment.CENTER),
+        video_container,
+        controls_bar,
+        transcript_section
+    ], scroll=ft.ScrollMode.AUTO, expand=True)
+
+    vocab_view = ft.Container(
+        content=ft.Column([
+            ft.Text("🎯 Thử Thách Luyện Dịch", size=18, weight=ft.FontWeight.BOLD),
+            quiz_area,
+            ft.Divider(),
+            ft.Text("📋 Sổ Từ Vựng Của Video", size=16, weight=ft.FontWeight.BOLD),
+            saved_vocab_col
+        ], scroll=ft.ScrollMode.AUTO),
+        padding=12,
+        expand=True
+    )
+
+    main_container = ft.Container(content=watch_view, expand=True)
+
+    def on_nav_change(e):
+        idx = page.navigation_bar.selected_index
+        if idx == 0:
+            main_container.content = watch_view
+        elif idx == 1:
+            main_container.content = vocab_view
+            refresh_vocab_ui()
+        elif idx == 2:
+            main_container.content = settings_view
+        page.update()
+
+    page.navigation_bar = ft.NavigationBar(
+        selected_index=0,
+        on_change=on_nav_change,
+        destinations=[
+            ft.NavigationBarDestination(icon=ft.Icons.SMART_DISPLAY, label="Xem Video"),
+            ft.NavigationBarDestination(icon=ft.Icons.EDIT_NOTE, label="Ôn Từ Vựng"),
+            ft.NavigationBarDestination(icon=ft.Icons.SETTINGS, label="Cài Đặt")
+        ]
+    )
+
+    page.add(main_container)
+
+if __name__ == "__main__":
+    ft.app(target=main)
